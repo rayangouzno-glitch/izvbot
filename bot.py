@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Set
 from uuid import uuid4
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -18,13 +18,15 @@ from telegram.constants import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
 TOKEN = "8761068431:AAEQBuY8_4Xp8qmraNPDcVjTR8DerpHJHVY"
-ADMIN_IDS = [1348427586, 1461183647]
+ADMIN_IDS = [1348427586]
 DATA_FILE = "exceptions_data.json"
+SETTINGS_FILE = "settings_data.json"
 THRESHOLD = 10
 
 # Хранилище для временных альбомов (в памяти)
 pending_albums = {}
 
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С ДАННЫМИ ==========
 def load_data():
     """Загружает данные из JSON файла"""
     if os.path.exists(DATA_FILE):
@@ -37,13 +39,37 @@ def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_settings():
+    """Загружает настройки"""
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"notify_all_users": False, "subscribed_users": []}
+
+def save_settings(settings):
+    """Сохраняет настройки"""
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+
 # ========== КЛАВИАТУРЫ ==========
 def get_main_keyboard():
     """Главное меню"""
     keyboard = [
-        [InlineKeyboardButton("📦 Заархивировать текущие исключения", callback_data="archive_current")],
+        [InlineKeyboardButton("📸 Текущие исключения", callback_data="show_current")],
+        [InlineKeyboardButton("📦 Заархивировать текущие", callback_data="archive_current")],
         [InlineKeyboardButton("📜 Архив исключений", callback_data="show_archives")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton("🗑 Очистить текущие", callback_data="clear_current")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_settings_keyboard(settings):
+    """Клавиатура настроек"""
+    notify_status = "✅ Вкл" if settings.get("notify_all_users", False) else "❌ Выкл"
+    keyboard = [
+        [InlineKeyboardButton(f"📢 Уведомления всем: {notify_status}", callback_data="toggle_notifications")],
+        [InlineKeyboardButton("👥 Список подписчиков", callback_data="show_subscribers")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -53,7 +79,6 @@ def get_archive_keyboard(archives: List[Dict]):
     for idx, archive in enumerate(archives):
         name = archive.get("name", "Без названия")
         date = archive.get("date", "")[:10]
-        # Подсчитываем количество элементов в архиве
         items_count = len(archive.get("items", []))
         keyboard.append([
             InlineKeyboardButton(f"📁 {name} ({date}) - {items_count} шт", callback_data=f"view_archive_{idx}"),
@@ -62,14 +87,72 @@ def get_archive_keyboard(archives: List[Dict]):
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_back_keyboard():
+    """Клавиатура с кнопкой назад"""
+    keyboard = [[InlineKeyboardButton("🔙 В главное меню", callback_data="back_to_main")]]
+    return InlineKeyboardMarkup(keyboard)
+
+# ========== ФУНКЦИИ ДЛЯ УВЕДОМЛЕНИЙ ==========
+async def notify_all_subscribers(context: ContextTypes.DEFAULT_TYPE, message: str, parse_mode: str = None):
+    """Отправляет уведомление всем подписчикам"""
+    settings = load_settings()
+    if not settings.get("notify_all_users", False):
+        return
+    
+    subscribers = settings.get("subscribed_users", [])
+    for user_id in subscribers:
+        try:
+            if user_id not in ADMIN_IDS:  # Не дублируем админу
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode=parse_mode,
+                    reply_markup=get_back_keyboard()
+                )
+        except Exception as e:
+            print(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+
+async def notify_new_exception(context: ContextTypes.DEFAULT_TYPE, exception_type: str, count: int):
+    """Уведомляет о новом исключении"""
+    settings = load_settings()
+    
+    # Уведомляем админа
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=f"✅ Новое исключение добавлено!\nТип: {exception_type}\nВсего исключений: {count}",
+            reply_markup=get_back_keyboard()
+        )
+    
+    # Уведомляем всех подписчиков (если включено)
+    if settings.get("notify_all_users", False):
+        subscribers = settings.get("subscribed_users", [])
+        for user_id in subscribers:
+            if user_id not in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"📸 Добавлено новое исключение!\nТип: {exception_type}\nВсего накоплено: {count}",
+                        reply_markup=get_back_keyboard()
+                    )
+                except:
+                    pass
+
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка команды /start"""
     user_id = update.effective_user.id
     
+    # Добавляем пользователя в подписчики (если他不是 админ)
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ У вас нет доступа к этому боту.")
-        return
+        settings = load_settings()
+        if user_id not in settings.get("subscribed_users", []):
+            settings["subscribed_users"].append(user_id)
+            save_settings(settings)
+            await update.message.reply_text(
+                "👋 Добро пожаловать!\n"
+                "Вы будете получать уведомления о новых исключениях (если админ включит эту функцию)."
+            )
     
     await update.message.reply_text(
         "🤖 *Бот для накопления исключений*\n\n"
@@ -79,7 +162,57 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Документы\n"
         "• Текст\n\n"
         "📦 Когда накопится больше 10 исключений, вы получите уведомление\n"
-        "💾 Используйте меню для архивации",
+        "💾 Используйте меню для управления",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard()
+    )
+
+async def show_current_exceptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущие накопленные исключения"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    data = load_data()
+    current = data["current_exceptions"]
+    
+    if not current:
+        await query.edit_message_text(
+            "📭 *Нет текущих исключений*\n\nОтправьте фото, документы или текст, чтобы начать накопление.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_back_keyboard()
+        )
+        return
+    
+    # Подсчитываем статистику
+    album_count = sum(1 for i in current if i["type"] == "album")
+    photo_count = sum(1 for i in current if i["type"] == "photo")
+    doc_count = sum(1 for i in current if i["type"] == "document")
+    text_count = sum(1 for i in current if i["type"] == "text")
+    photos_in_albums = sum(len(i["items"]) for i in current if i["type"] == "album")
+    
+    msg = f"📸 *Текущие исключения*\n\n"
+    msg += f"📊 *Статистика:*\n"
+    msg += f"• Альбомов: {album_count} (всего фото: {photos_in_albums})\n"
+    msg += f"• Одиночных фото: {photo_count}\n"
+    msg += f"• Документов: {doc_count}\n"
+    msg += f"• Текстов: {text_count}\n\n"
+    msg += f"📦 *Всего исключений:* {len(current)}\n"
+    msg += f"⚠️ *Порог:* {THRESHOLD}\n\n"
+    msg += f"⬇️ *Содержимое:*"
+    
+    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+    
+    # Показываем содержимое
+    for item in current:
+        await send_exception(context, query.message.chat_id, item)
+        await asyncio.sleep(0.3)
+    
+    await query.message.reply_text(
+        "📌 *Управление:*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=get_main_keyboard()
     )
@@ -93,7 +226,6 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     media_group_id = update.message.media_group_id
     chat_id = update.effective_chat.id
     
-    # Если этого альбома еще нет в pending
     if media_group_id not in pending_albums:
         pending_albums[media_group_id] = {
             "items": [],
@@ -102,7 +234,6 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "message_id": update.message.message_id
         }
     
-    # Добавляем фото в альбом
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
         pending_albums[media_group_id]["items"].append({
@@ -110,17 +241,15 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "file_id": file_id
         })
     
-    # Отменяем предыдущий таймер, если есть
     if f"timer_{media_group_id}" in context.user_data:
         context.user_data[f"timer_{media_group_id}"].cancel()
     
-    # Устанавливаем новый таймер на сохранение альбома
     task = asyncio.create_task(save_album_after_delay(update, context, media_group_id))
     context.user_data[f"timer_{media_group_id}"] = task
 
 async def save_album_after_delay(update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str):
-    """Сохраняет альбом после задержки (чтобы собрать все фото)"""
-    await asyncio.sleep(1.5)  # Ждем 1.5 секунды для сбора всех фото альбома
+    """Сохраняет альбом после задержки"""
+    await asyncio.sleep(1.5)
     
     if media_group_id in pending_albums:
         album_data = pending_albums[media_group_id]
@@ -128,7 +257,6 @@ async def save_album_after_delay(update: Update, context: ContextTypes.DEFAULT_T
         if album_data["items"]:
             data = load_data()
             
-            # Сохраняем альбом как один объект
             album_exception = {
                 "type": "album",
                 "album_id": str(uuid4()),
@@ -138,38 +266,38 @@ async def save_album_after_delay(update: Update, context: ContextTypes.DEFAULT_T
             data["current_exceptions"].append(album_exception)
             save_data(data)
             
-            # Отправляем подтверждение
             photo_count = len(album_data["items"])
             total_count = len(data["current_exceptions"])
             
             await context.bot.send_message(
                 chat_id=album_data["chat_id"],
-                text=f"✅ Добавлено {photo_count}. Всего исключений: {total_count}"
+                text=f"✅ Альбом из {photo_count} фото добавлен! Всего: {total_count}",
+                reply_markup=get_back_keyboard()
             )
             
-            # Проверяем порог
+            # Уведомления
+            await notify_new_exception(context, f"альбом ({photo_count} фото)", total_count)
+            
             if total_count > THRESHOLD:
                 for admin_id in ADMIN_IDS:
                     await context.bot.send_message(
                         admin_id,
-                        f"⚠️ Накопилось {total_count} исключений (больше {THRESHOLD})\nПора исключить людей!",
-                        parse_mode=ParseMode.MARKDOWN
+                        f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {total_count} исключений!\nПора исключить людей!",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=get_back_keyboard()
                     )
+                await notify_all_subscribers(context, f"⚠️ Внимание! Накопилось {total_count} исключений!")
         
-        # Удаляем из временного хранилища
         del pending_albums[media_group_id]
-        
-        # Удаляем таймер
         if f"timer_{media_group_id}" in context.user_data:
             del context.user_data[f"timer_{media_group_id}"]
 
 async def handle_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка одиночного фото (не в альбоме)"""
+    """Обработка одиночного фото"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         return
     
-    # Если это часть медиа-группы, игнорируем (обработается handle_media_group)
     if update.message.media_group_id:
         return
     
@@ -184,15 +312,19 @@ async def handle_single_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_data(data)
     
     count = len(data["current_exceptions"])
-    await update.message.reply_text(f"✅ Одиночное фото добавлено. Всего исключений: {count}")
+    await update.message.reply_text(f"✅ Фото добавлено! Всего: {count}", reply_markup=get_back_keyboard())
+    
+    await notify_new_exception(context, "фото", count)
     
     if count > THRESHOLD:
         for admin_id in ADMIN_IDS:
             await context.bot.send_message(
                 admin_id,
-                f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {count} исключений (больше {THRESHOLD})\nПора исключить людей!",
-                parse_mode=ParseMode.MARKDOWN
+                f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {count} исключений!\nПора исключить людей!",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=get_back_keyboard()
             )
+        await notify_all_subscribers(context, f"⚠️ Внимание! Накопилось {count} исключений!")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка документов"""
@@ -213,15 +345,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     
     count = len(data["current_exceptions"])
-    await update.message.reply_text(f"✅ Документ '{file_name}' добавлен. Всего исключений: {count}")
+    await update.message.reply_text(f"✅ Документ '{file_name}' добавлен! Всего: {count}", reply_markup=get_back_keyboard())
+    
+    await notify_new_exception(context, f"документ ({file_name})", count)
     
     if count > THRESHOLD:
         for admin_id in ADMIN_IDS:
             await context.bot.send_message(
                 admin_id,
-                f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {count} исключений (больше {THRESHOLD})\nПора исключить людей!",
-                parse_mode=ParseMode.MARKDOWN
+                f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {count} исключений!\nПора исключить людей!",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=get_back_keyboard()
             )
+        await notify_all_subscribers(context, f"⚠️ Внимание! Накопилось {count} исключений!")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений"""
@@ -229,7 +365,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ADMIN_IDS:
         return
     
-    # Если ждем название архива
     if context.user_data.get("awaiting_archive_name"):
         archive_name = update.message.text.strip()
         context.user_data["awaiting_archive_name"] = False
@@ -247,8 +382,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await update.message.reply_text(
                 f"✅ Архив *{archive_name}* сохранён!\n"
-                f"📦 Содержит {len(archive['items'])} элементов\n\n"
-                f"Теперь можно накапливать новые исключения",
+                f"📦 Содержит {len(archive['items'])} элементов",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=get_main_keyboard()
             )
@@ -256,7 +390,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Нет исключений для архивации", reply_markup=get_main_keyboard())
         return
     
-    # Обычный текст как исключение
     data = load_data()
     data["current_exceptions"].append({
         "type": "text",
@@ -266,37 +399,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     
     count = len(data["current_exceptions"])
-    await update.message.reply_text(f"✅ Текст добавлен. Всего исключений: {count}")
+    await update.message.reply_text(f"✅ Текст добавлен! Всего: {count}", reply_markup=get_back_keyboard())
+    
+    await notify_new_exception(context, "текст", count)
     
     if count > THRESHOLD:
         for admin_id in ADMIN_IDS:
             await context.bot.send_message(
                 admin_id,
                 f"⚠️ *ВНИМАНИЕ!*\n\nНакопилось {count} исключений!",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=get_back_keyboard()
             )
-
-async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка пересланных сообщений"""
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    
-    # Если переслан альбом
-    if update.message.media_group_id:
-        await handle_media_group(update, context)
-        return
-    
-    # Пересланное фото
-    if update.message.photo:
-        await handle_single_photo(update, context)
+        await notify_all_subscribers(context, f"⚠️ Внимание! Накопилось {count} исключений!")
 
 # ========== ФУНКЦИИ ДЛЯ ОТПРАВКИ ==========
 async def send_exception(context: ContextTypes.DEFAULT_TYPE, chat_id: int, exception: Dict):
-    """Отправляет одно исключение (может быть альбомом, фото, документом или текстом)"""
-    
+    """Отправляет одно исключение"""
     if exception["type"] == "album":
-        # Отправляем как альбом
         media_group = []
         for item in exception["items"]:
             if item["type"] == "photo":
@@ -306,9 +426,7 @@ async def send_exception(context: ContextTypes.DEFAULT_TYPE, chat_id: int, excep
             try:
                 await context.bot.send_media_group(chat_id=chat_id, media=media_group)
                 return True
-            except Exception as e:
-                print(f"Ошибка отправки альбома: {e}")
-                # Если не получилось отправить альбом, отправляем по отдельности
+            except:
                 for item in exception["items"]:
                     await context.bot.send_photo(chat_id=chat_id, photo=item["file_id"])
                     await asyncio.sleep(0.3)
@@ -335,15 +453,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = update.effective_user.id
+    
+    # Настройки доступны всем, но изменение только админу
+    if query.data == "settings":
+        settings = load_settings()
+        await query.edit_message_text(
+            "⚙️ *Настройки бота*\n\n"
+            "Здесь можно настроить уведомления для всех пользователей.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_settings_keyboard(settings)
+        )
+        return
+    
+    # Остальные функции только для админа
     if user_id not in ADMIN_IDS:
-        await query.edit_message_text("⛔ Нет доступа")
+        await query.edit_message_text("⛔ Нет доступа", reply_markup=get_back_keyboard())
         return
     
     data = load_data()
+    settings = load_settings()
     
-    if query.data == "archive_current":
+    if query.data == "show_current":
+        await show_current_exceptions(update, context)
+    
+    elif query.data == "archive_current":
         if len(data["current_exceptions"]) == 0:
-            await query.edit_message_text("❌ Нет исключений для архивации")
+            await query.edit_message_text("❌ Нет исключений для архивации", reply_markup=get_back_keyboard())
             return
         
         context.user_data["awaiting_archive_name"] = True
@@ -354,10 +489,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "show_archives":
         if not data["archives"]:
-            await query.edit_message_text("📭 Архив пуст", reply_markup=get_main_keyboard())
+            await query.edit_message_text("📭 Архив пуст", reply_markup=get_back_keyboard())
         else:
             await query.edit_message_text(
-                "📚 *Архив исключений:*\n\n🗑 Нажмите на корзину, чтобы удалить архив",
+                "📚 *Архив исключений:*",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=get_archive_keyboard(data["archives"])
             )
@@ -373,6 +508,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "cancel_archive":
         context.user_data.pop("awaiting_archive_name", None)
         await query.edit_message_text("Архивация отменена", reply_markup=get_main_keyboard())
+    
+    elif query.data == "toggle_notifications":
+        settings["notify_all_users"] = not settings.get("notify_all_users", False)
+        save_settings(settings)
+        status = "включены" if settings["notify_all_users"] else "выключены"
+        await query.edit_message_text(
+            f"✅ Уведомления для всех пользователей {status}\n\n"
+            f"Теперь {'будут' if settings['notify_all_users'] else 'не будут'} приходить уведомления о новых исключениях.",
+            reply_markup=get_settings_keyboard(settings)
+        )
+    
+    elif query.data == "show_subscribers":
+        subscribers = settings.get("subscribed_users", [])
+        if not subscribers:
+            await query.edit_message_text("👥 Нет подписчиков", reply_markup=get_settings_keyboard(settings))
+        else:
+            msg = "👥 *Список подписчиков:*\n\n"
+            for idx, sub_id in enumerate(subscribers, 1):
+                msg += f"{idx}. `{sub_id}`\n"
+            await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_settings_keyboard(settings))
     
     elif query.data.startswith("delete_archive_"):
         idx = int(query.data.split("_")[2])
@@ -398,17 +553,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             date = archive.get("date", "")
             items = archive.get("items", [])
             
-            # Подсчитываем количество элементов разных типов
             album_count = sum(1 for i in items if i["type"] == "album")
             photo_count = sum(1 for i in items if i["type"] == "photo")
             doc_count = sum(1 for i in items if i["type"] == "document")
             text_count = sum(1 for i in items if i["type"] == "text")
-            
             photos_in_albums = sum(len(i["items"]) for i in items if i["type"] == "album")
             
             msg = f"📦 *{name}*\n📅 {date[:10]}\n\n"
             msg += f"📊 Статистика:\n"
-            msg += f"• Альбомов: {album_count} (всего фото в альбомах: {photos_in_albums})\n"
+            msg += f"• Альбомов: {album_count} (всего фото: {photos_in_albums})\n"
             msg += f"• Одиночных фото: {photo_count}\n"
             msg += f"• Документов: {doc_count}\n"
             msg += f"• Текстов: {text_count}\n\n"
@@ -416,12 +569,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
             
-            # Отправляем все элементы архива
             for item in items:
                 await send_exception(context, query.message.chat_id, item)
-                await asyncio.sleep(0.5)  # Задержка между отправками
+                await asyncio.sleep(0.5)
             
-            # Отправляем клавиатуру для управления архивом
             keyboard = [
                 [InlineKeyboardButton("🗑 Удалить этот архив", callback_data=f"delete_archive_{idx}")],
                 [InlineKeyboardButton("🔙 К списку архивов", callback_data="show_archives")]
@@ -435,24 +586,26 @@ def main():
     print(f"👑 Администратор: {ADMIN_IDS[0]}")
     print(f"📊 Порог уведомлений: {THRESHOLD}")
     print("✅ Бот готов к работе!\n")
-    print("📸 Отправляйте альбомы - они будут сохраняться как одно исключение!")
+    print("📸 Особенности:")
+    print("• Альбомы сохраняются как одно исключение")
+    print("• Есть кнопка 'Текущие исключения' для просмотра")
+    print("• Уведомления можно включить для всех пользователей")
+    print("• Кнопка 'Меню' добавлена к каждому сообщению")
     
-    # Создаем приложение
     app = Application.builder().token(TOKEN).build()
     
     # Команды
     app.add_handler(CommandHandler("start", start))
     
-    # Обработчики сообщений (ВАЖНО: порядок имеет значение!)
+    # Обработчики сообщений
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.FORWARDED, handle_single_photo))
-    app.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, handle_forwarded))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.FORWARDED, handle_media_group))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
     # Обработка кнопок
     app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Запуск
     app.run_polling()
 
 if __name__ == "__main__":
