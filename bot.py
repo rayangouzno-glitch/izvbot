@@ -18,7 +18,7 @@ from telegram.constants import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
 TOKEN = "8761068431:AAEQBuY8_4Xp8qmraNPDcVjTR8DerpHJHVY"
-ADMIN_IDS = [1348427586]
+ADMIN_IDS = [1348427586, 1461183647]
 DATA_FILE = "exceptions_data.json"
 THRESHOLD = 10
 
